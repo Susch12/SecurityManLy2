@@ -285,7 +285,7 @@ generate_network_state() {
         # Clasificar paquetes por protocolo
         # Handle both _source.layers and direct field access
         map(
-            if has("_source") then ._source.layers else . end |
+            (if (type == "object" and has("_source")) then ._source.layers else . end) |
             {
                 timestamp: (.["frame.time_epoch"][0] // .["frame.time_epoch"] // "0" | tonumber),
                 protocols: (.["frame.protocols"][0] // .["frame.protocols"] // ""),
