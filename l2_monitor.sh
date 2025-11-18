@@ -283,39 +283,43 @@ analyze_traffic() {
 generate_network_state() {
     jq -r '
         # Clasificar paquetes por protocolo
-        map({
-            timestamp: (._source.layers["frame.time_epoch"][0] | tonumber),
-            protocols: (._source.layers["frame.protocols"][0] // ""),
-            eth_src: (._source.layers["eth.src"][0] // ""),
-            eth_dst: (._source.layers["eth.dst"][0] // ""),
+        # Handle both _source.layers and direct field access
+        map(
+            if has("_source") then ._source.layers else . end |
+            {
+                timestamp: (.["frame.time_epoch"][0] // .["frame.time_epoch"] // "0" | tonumber),
+                protocols: (.["frame.protocols"][0] // .["frame.protocols"] // ""),
+                eth_src: (.["eth.src"][0] // .["eth.src"] // ""),
+                eth_dst: (.["eth.dst"][0] // .["eth.dst"] // ""),
 
-            # ARP
-            arp_opcode: (._source.layers["arp.opcode"][0] // null),
-            arp_src_mac: (._source.layers["arp.src.hw_mac"][0] // null),
-            arp_src_ip: (._source.layers["arp.src.proto_ipv4"][0] // null),
-            arp_dst_mac: (._source.layers["arp.dst.hw_mac"][0] // null),
-            arp_dst_ip: (._source.layers["arp.dst.proto_ipv4"][0] // null),
+                # ARP
+                arp_opcode: (.["arp.opcode"][0] // .["arp.opcode"] // null),
+                arp_src_mac: (.["arp.src.hw_mac"][0] // .["arp.src.hw_mac"] // null),
+                arp_src_ip: (.["arp.src.proto_ipv4"][0] // .["arp.src.proto_ipv4"] // null),
+                arp_dst_mac: (.["arp.dst.hw_mac"][0] // .["arp.dst.hw_mac"] // null),
+                arp_dst_ip: (.["arp.dst.proto_ipv4"][0] // .["arp.dst.proto_ipv4"] // null),
 
-            # DHCP
-            dhcp_type: (._source.layers["dhcp.option.dhcp"][0] // null),
-            dhcp_server: (._source.layers["dhcp.option.dhcp_server_id"][0] // null),
-            dhcp_client_mac: (._source.layers["dhcp.hw.mac_addr"][0] // null),
-            dhcp_client_ip: (._source.layers["dhcp.ip.client"][0] // null),
-            dhcp_your_ip: (._source.layers["dhcp.ip.your"][0] // null),
+                # DHCP
+                dhcp_type: (.["dhcp.option.dhcp"][0] // .["dhcp.option.dhcp"] // null),
+                dhcp_server: (.["dhcp.option.dhcp_server_id"][0] // .["dhcp.option.dhcp_server_id"] // null),
+                dhcp_client_mac: (.["dhcp.hw.mac_addr"][0] // .["dhcp.hw.mac_addr"] // null),
+                dhcp_client_ip: (.["dhcp.ip.client"][0] // .["dhcp.ip.client"] // null),
+                dhcp_your_ip: (.["dhcp.ip.your"][0] // .["dhcp.ip.your"] // null),
 
-            # STP
-            stp_root: (._source.layers["stp.root.hw"][0] // null),
-            stp_bridge: (._source.layers["stp.bridge.hw"][0] // null),
-            stp_type: (._source.layers["stp.type"][0] // null),
+                # STP
+                stp_root: (.["stp.root.hw"][0] // .["stp.root.hw"] // null),
+                stp_bridge: (.["stp.bridge.hw"][0] // .["stp.bridge.hw"] // null),
+                stp_type: (.["stp.type"][0] // .["stp.type"] // null),
 
-            # CDP
-            cdp_device: (._source.layers["cdp.deviceid"][0] // null),
-            cdp_platform: (._source.layers["cdp.platform"][0] // null),
+                # CDP
+                cdp_device: (.["cdp.deviceid"][0] // .["cdp.deviceid"] // null),
+                cdp_platform: (.["cdp.platform"][0] // .["cdp.platform"] // null),
 
-            # LLDP
-            lldp_chassis: (._source.layers["lldp.chassis.id"][0] // null),
-            lldp_port: (._source.layers["lldp.port.id"][0] // null)
-        }) |
+                # LLDP
+                lldp_chassis: (.["lldp.chassis.id"][0] // .["lldp.chassis.id"] // null),
+                lldp_port: (.["lldp.port.id"][0] // .["lldp.port.id"] // null)
+            }
+        ) |
 
         # Estadísticas por protocolo
         {
