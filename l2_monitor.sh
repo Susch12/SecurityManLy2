@@ -201,6 +201,10 @@ capture_live() {
 
     log "INFO" "Modo LIVE: ${interface} | Protocolos: ${ENABLED_PROTOCOLS[*]}"
     log "INFO" "Presionar Ctrl+C para detener..."
+    log "INFO" "Análisis automático cada 50 paquetes..."
+
+    local packet_counter=0
+    local analysis_interval=50
 
     tshark -i "$interface" -f "$filter" -T json \
         -e frame.time_epoch \
@@ -220,9 +224,15 @@ capture_live() {
         2>/dev/null | while read -r line; do
         echo "$line" >> "${PROTOCOL_DATA}.tmp"
 
-        if [ $((RANDOM % 10)) -eq 0 ]; then
+        packet_counter=$((packet_counter + 1))
+
+        # Trigger analysis every N packets
+        if [ $((packet_counter % analysis_interval)) -eq 0 ]; then
             mv "${PROTOCOL_DATA}.tmp" "$PROTOCOL_DATA" 2>/dev/null || true
-            [ -s "$PROTOCOL_DATA" ] && analyze_traffic && echo ""
+            if [ -s "$PROTOCOL_DATA" ]; then
+                log "INFO" "Analizando ${packet_counter} paquetes capturados..."
+                analyze_traffic && echo ""
+            fi
         fi
     done
 }
