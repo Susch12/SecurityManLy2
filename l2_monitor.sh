@@ -466,19 +466,27 @@ capture_traffic() {
         echo "[]" > "$PROTOCOL_DATA"
         debug "WARN" "Empty capture - created empty JSON array"
     else
-        debug "DEBUG" "Converting newline-delimited JSON to array..."
-
         # Save raw output in debug mode
         if [ "$DEBUG_MODE" = true ]; then
             cp "$PROTOCOL_DATA" "${DEBUG_DIR}/tshark_raw_output.json"
             debug "DEBUG" "Raw tshark output saved to: ${DEBUG_DIR}/tshark_raw_output.json"
         fi
 
-        # Convert newline-delimited JSON to proper JSON array
-        jq -s '.' "$PROTOCOL_DATA" > "${PROTOCOL_DATA}.tmp" 2>/dev/null || echo "[]" > "${PROTOCOL_DATA}.tmp"
-        mv "${PROTOCOL_DATA}.tmp" "$PROTOCOL_DATA"
+        # Detect if tshark output is already a JSON array or newline-delimited
+        local first_char=$(head -c 1 "$PROTOCOL_DATA" 2>/dev/null)
 
-        debug "DEBUG" "JSON array conversion complete"
+        if [ "$first_char" = "[" ]; then
+            # Already a valid JSON array - just validate and prettify
+            debug "DEBUG" "Detected JSON array format (modern tshark)"
+            jq '.' "$PROTOCOL_DATA" > "${PROTOCOL_DATA}.tmp" 2>/dev/null || echo "[]" > "${PROTOCOL_DATA}.tmp"
+        else
+            # Newline-delimited JSON - convert to array
+            debug "DEBUG" "Detected NDJSON format - converting to array..."
+            jq -s '.' "$PROTOCOL_DATA" > "${PROTOCOL_DATA}.tmp" 2>/dev/null || echo "[]" > "${PROTOCOL_DATA}.tmp"
+        fi
+
+        mv "${PROTOCOL_DATA}.tmp" "$PROTOCOL_DATA"
+        debug "DEBUG" "JSON processing complete"
     fi
 
     local packet_count=$(jq '. | length' "$PROTOCOL_DATA" 2>/dev/null || echo "0")
