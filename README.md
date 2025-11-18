@@ -288,6 +288,33 @@ readonly ALERT_COOLDOWN=300                # Cooldown entre alertas (5 min)
 readonly MIN_ALERT_SEVERITY="MEDIUM"       # Severidad mínima
 ```
 
+## Debug Mode
+
+Para troubleshooting de problemas de captura o procesamiento, usa el modo debug:
+
+```bash
+sudo ./l2_monitor.sh -d 30 -D
+```
+
+El modo debug proporciona:
+- Salida verbose en tiempo real con timestamps
+- Validación de JSON en cada paso
+- Inspección de campos tshark capturados
+- Archivos de debug guardados en `./debug/`
+
+### Archivos de Debug Generados
+
+```
+debug/
+├── debug.log                    # Log completo de debug
+├── tshark_raw_output.json       # Salida cruda de tshark
+├── sample_packet.json           # Primer paquete capturado
+├── protocol_breakdown.txt       # Conteo por protocolo
+└── network_state_pretty.json    # Estado de red formateado
+```
+
+**Documentación completa**: Ver [DEBUG_MODE.md](DEBUG_MODE.md)
+
 ## Troubleshooting
 
 ### Error: "Herramientas faltantes"
@@ -315,6 +342,10 @@ sudo ./l2_monitor.sh -i eth0
 
 # Verificar que hay tráfico ARP
 sudo tcpdump -i eth0 arp
+
+# Usar modo debug para diagnóstico detallado
+sudo ./l2_monitor.sh -i eth0 -d 30 -D
+# Revisar debug/tshark_stderr.log y debug/protocol_breakdown.txt
 ```
 
 ### Alertas por email no funcionan
