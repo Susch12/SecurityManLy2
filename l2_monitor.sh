@@ -160,6 +160,9 @@ capture_traffic() {
     log "INFO" "Filtro BPF: $filter"
 
     local tshark_error="${SCRIPT_DIR}/tshark_error.log"
+
+    # Disable exit-on-error temporarily to handle timeout exit code 124
+    set +e
     timeout "$duration" tshark -i "$interface" -f "$filter" \
         -T json \
         -e frame.time_epoch \
@@ -188,6 +191,7 @@ capture_traffic() {
         > "$PROTOCOL_DATA" 2>"$tshark_error"
 
     local exit_code=$?
+    set -e  # Re-enable exit-on-error
 
     # Mostrar errores de tshark si existen
     if [ -s "$tshark_error" ]; then
