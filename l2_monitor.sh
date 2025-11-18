@@ -284,8 +284,15 @@ generate_network_state() {
     jq -r '
         # Clasificar paquetes por protocolo
         # Handle both _source.layers and direct field access
+        # Filter out non-object elements first
         map(
-            (if (type == "object" and has("_source")) then ._source.layers else . end) |
+            if (type == "object" and has("_source")) then ._source.layers
+            elif type == "object" then .
+            else empty
+            end
+        ) |
+        map(
+            select(type == "object") |
             {
                 timestamp: (.["frame.time_epoch"][0] // .["frame.time_epoch"] // "0" | tonumber),
                 protocols: (.["frame.protocols"][0] // .["frame.protocols"] // ""),
