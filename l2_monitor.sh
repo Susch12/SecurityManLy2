@@ -99,8 +99,23 @@ check_requirements() {
 get_interface() {
     local interface="${1:-}"
     if [ -z "$interface" ]; then
-        interface=$(ip route | grep default | awk '{print $5}' | head -n 1)
-        [ -z "$interface" ] && error "No se pudo detectar interfaz de red"
+        # Try ip command first
+        if command -v ip &> /dev/null; then
+            interface=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -n 1)
+        fi
+
+        # Fallback: try to find first non-lo interface
+        if [ -z "$interface" ] && [ -d /sys/class/net ]; then
+            for iface in /sys/class/net/*; do
+                iface_name=$(basename "$iface")
+                if [ "$iface_name" != "lo" ]; then
+                    interface="$iface_name"
+                    break
+                fi
+            done
+        fi
+
+        [ -z "$interface" ] && error "No se pudo detectar interfaz de red. Usar -i para especificar manualmente."
     fi
     echo "$interface"
 }
