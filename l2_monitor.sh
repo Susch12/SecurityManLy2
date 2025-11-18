@@ -1029,6 +1029,14 @@ EOF
 generate_device_profiles() {
     [ ! -s "$PROTOCOL_DATA" ] && log "WARN" "No hay datos para perfilar dispositivos" && return
 
+    local packet_count=$(jq '. | length' "$PROTOCOL_DATA" 2>/dev/null || echo "0")
+
+    if [ "$packet_count" -eq 0 ]; then
+        log "WARN" "No hay paquetes para perfilar (0 capturados)"
+        echo "[]" > "$PROFILE_FILE"
+        return 0
+    fi
+
     log "INFO" "Generando perfiles de dispositivos..."
     debug "DEBUG" "=== GENERATING DEVICE PROFILES ==="
 
