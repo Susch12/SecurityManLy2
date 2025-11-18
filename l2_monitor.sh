@@ -208,9 +208,13 @@ capture_traffic() {
     if [ ! -s "$PROTOCOL_DATA" ]; then
         log "WARN" "No se capturaron paquetes. Verificar interfaz y tráfico."
         echo "[]" > "$PROTOCOL_DATA"
+    else
+        # Convert newline-delimited JSON to proper JSON array
+        jq -s '.' "$PROTOCOL_DATA" > "${PROTOCOL_DATA}.tmp" 2>/dev/null || echo "[]" > "${PROTOCOL_DATA}.tmp"
+        mv "${PROTOCOL_DATA}.tmp" "$PROTOCOL_DATA"
     fi
 
-    local packet_count=$(jq '. | length' "$PROTOCOL_DATA")
+    local packet_count=$(jq '. | length' "$PROTOCOL_DATA" 2>/dev/null || echo "0")
     log "INFO" "Capturados ${packet_count} paquetes"
 }
 
@@ -533,8 +537,14 @@ detect_discovery_recon() {
 trigger_alert() {
     local alert_json="$1"
 
-    local severity=$(echo "$alert_json" | jq -r '.severity')
-    local rule=$(echo "$alert_json" | jq -r '.rule')
+    # Validate JSON input
+    if [ -z "$alert_json" ]; then
+        log "WARN" "trigger_alert: empty alert_json"
+        return
+    fi
+
+    local severity=$(echo "$alert_json" | jq -r '.severity // empty' 2>/dev/null)
+    local rule=$(echo "$alert_json" | jq -r '.rule // empty' 2>/dev/null)
 
     check_severity_threshold "$severity" || return
     check_alert_cooldown "$rule" || return
@@ -552,6 +562,12 @@ trigger_alert() {
 check_severity_threshold() {
     local severity="$1"
     local min_level="$MIN_ALERT_SEVERITY"
+
+    # Validate input
+    if [ -z "$severity" ]; then
+        log "WARN" "check_severity_threshold: severity is empty"
+        return 1
+    fi
 
     declare -A severity_levels=([CRITICAL]=3 [HIGH]=2 [MEDIUM]=1)
 
