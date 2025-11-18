@@ -184,13 +184,18 @@ debug_tshark_fields() {
     # Count packets by protocol
     debug "DEBUG" "Packet distribution:"
     jq -r '
-        group_by(
+        # Normalize and extract protocols
+        map(
             if type == "object" and has("_source") then ._source.layers["frame.protocols"][0]
             elif type == "object" then .["frame.protocols"][0]
             else "unknown"
             end
         ) |
-        map({protocol: .[0] | if type == "object" and has("_source") then ._source.layers["frame.protocols"][0] elif type == "object" then .["frame.protocols"][0] else "unknown" end, count: length}) |
+        group_by(.) |
+        map({
+            protocol: .[0],
+            count: length
+        }) |
         .[] |
         "  \(.protocol): \(.count) packets"
     ' "$file" 2>/dev/null | while IFS= read -r line; do
