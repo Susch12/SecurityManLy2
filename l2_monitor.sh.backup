@@ -1,0 +1,655 @@
+#!/bin/bash
+
+################################################################################
+# Layer 2 Network Attack Detection System
+# Detecta: ARP Spoofing, MITM, ARP Flooding, MAC Flooding, Reconnaissance
+################################################################################
+
+set -euo pipefail
+
+# ==================== CONFIGURACIÓN ====================
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly CAPTURE_FILE="${SCRIPT_DIR}/arp_capture.pcap"
+readonly JSON_DATA="${SCRIPT_DIR}/arp_data.json"
+readonly STATE_FILE="${SCRIPT_DIR}/network_state.json"
+readonly LOG_FILE="${SCRIPT_DIR}/l2_monitor.log"
+readonly ALERT_LOG="${SCRIPT_DIR}/alerts.log"
+
+# Configuración de detección
+readonly TIME_WINDOW=60                    # Ventana de análisis en segundos
+readonly ARP_FLOOD_THRESHOLD=50            # Paquetes ARP por minuto
+readonly IP_CHANGE_WINDOW=30               # Segundos para detectar cambio rápido de IP
+readonly MAC_FLAP_THRESHOLD=5              # Cambios de MAC por minuto
+readonly MIN_CAPTURE_DURATION=30           # Duración mínima de captura
+
+# Configuración de alertas
+# Detectar email configurado en msmtp
+DETECTED_EMAIL=$(grep -E "^from" /etc/msmtprc 2>/dev/null | awk '{print $2}' | head -n 1)
+ALERT_EMAIL="${ALERT_EMAIL:-${DETECTED_EMAIL:-jesuscg1205@gmail.com}}"
+MSMTP_ACCOUNT="${MSMTP_ACCOUNT:-gmail}"
+readonly ALERT_COOLDOWN=300                # 5 minutos entre alertas del mismo tipo
+MIN_ALERT_SEVERITY="${MIN_ALERT_SEVERITY:-MEDIUM}"
+
+# Colores para output
+readonly RED='\033[0;31m'
+readonly YELLOW='\033[1;33m'
+readonly GREEN='\033[0;32m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly BOLD='\033[1m'
+readonly NC='\033[0m' # No Color
+
+# ==================== FUNCIONES DE UTILIDAD ====================
+
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] [${level}] ${message}" | tee -a "${LOG_FILE}"
+}
+
+error() {
+    log "ERROR" "$@" >&2
+    exit 1
+}
+
+check_requirements() {
+    local missing_tools=()
+    local missing_optional=()
+
+    # Herramientas requeridas
+    for tool in tshark jq; do
+        if ! command -v "$tool" &> /dev/null; then
+            missing_tools+=("$tool")
+        fi
+    done
+
+    # Herramientas opcionales
+    if ! command -v msmtp &> /dev/null; then
+        missing_optional+=("msmtp (alertas por email)")
+    fi
+
+    if [ ${#missing_tools[@]} -gt 0 ]; then
+        error "Herramientas requeridas faltantes: ${missing_tools[*]}\nInstalar con: sudo apt-get install tshark jq"
+    fi
+
+    if [ ${#missing_optional[@]} -gt 0 ]; then
+        log "WARN" "Herramientas opcionales no disponibles: ${missing_optional[*]}"
+    fi
+
+    # Verificar permisos para captura de red
+    if ! tshark -D &> /dev/null; then
+        error "Permisos insuficientes. Ejecutar con sudo o configurar capabilities:\nsudo setcap cap_net_raw,cap_net_admin=eip \$(which tshark)"
+    fi
+
+    # Verificar configuración de msmtp si está disponible
+    if command -v msmtp &> /dev/null; then
+        if [ -f /etc/msmtprc ]; then
+            log "INFO" "Alertas por email habilitadas → ${ALERT_EMAIL}"
+        else
+            log "WARN" "msmtp instalado pero /etc/msmtprc no encontrado"
+        fi
+    fi
+}
+
+get_interface() {
+    local interface="${1:-}"
+
+    if [ -z "$interface" ]; then
+        # Auto-detectar interfaz principal
+        interface=$(ip route | grep default | awk '{print $5}' | head -n 1)
+        if [ -z "$interface" ]; then
+            error "No se pudo detectar interfaz de red. Especificar manualmente."
+        fi
+    fi
+
+    echo "$interface"
+}
+
+# ==================== CAPTURA DE TRÁFICO ====================
+
+capture_arp_traffic() {
+    local interface="$1"
+    local duration="$2"
+
+    log "INFO" "Iniciando captura ARP en ${interface} por ${duration}s..."
+
+    # Capturar solo tráfico ARP
+    timeout "$duration" tshark -i "$interface" -f "arp" \
+        -T json \
+        -e frame.time_epoch \
+        -e arp.opcode \
+        -e arp.src.hw_mac \
+        -e arp.src.proto_ipv4 \
+        -e arp.dst.hw_mac \
+        -e arp.dst.proto_ipv4 \
+        > "$JSON_DATA" 2>/dev/null || true
+
+    if [ ! -s "$JSON_DATA" ]; then
+        error "No se capturaron paquetes ARP. Verificar interfaz y tráfico de red."
+    fi
+
+    local packet_count=$(jq '. | length' "$JSON_DATA")
+    log "INFO" "Capturados ${packet_count} paquetes ARP"
+}
+
+capture_live() {
+    local interface="$1"
+
+    log "INFO" "Iniciando modo LIVE en ${interface}. Presionar Ctrl+C para detener..."
+
+    # Captura continua con análisis incremental
+    tshark -i "$interface" -f "arp" -T json \
+        -e frame.time_epoch \
+        -e arp.opcode \
+        -e arp.src.hw_mac \
+        -e arp.src.proto_ipv4 \
+        -e arp.dst.hw_mac \
+        -e arp.dst.proto_ipv4 \
+        2>/dev/null | while read -r line; do
+
+        # Acumular JSON
+        echo "$line" >> "${JSON_DATA}.tmp"
+
+        # Cada 10 segundos, analizar
+        if [ $((RANDOM % 10)) -eq 0 ]; then
+            mv "${JSON_DATA}.tmp" "$JSON_DATA" 2>/dev/null || true
+            if [ -s "$JSON_DATA" ]; then
+                analyze_traffic
+                echo ""
+            fi
+        fi
+    done
+}
+
+# ==================== MOTOR DE CORRELACIÓN ====================
+
+analyze_traffic() {
+    if [ ! -s "$JSON_DATA" ]; then
+        log "WARN" "No hay datos para analizar"
+        return
+    fi
+
+    log "INFO" "Analizando tráfico con motor de correlación..."
+
+    # Generar estado de red
+    generate_network_state
+
+    # Ejecutar reglas de detección
+    detect_mac_duplicate
+    detect_ip_conflict
+    detect_sudden_ip_change
+    detect_arp_flood
+    detect_mac_flapping
+
+    # Generar reporte
+    generate_report
+}
+
+generate_network_state() {
+    jq -r '
+        map({
+            timestamp: (._source.layers["frame.time_epoch"][0] | tonumber),
+            opcode: ._source.layers["arp.opcode"][0],
+            src_mac: ._source.layers["arp.src.hw_mac"][0],
+            src_ip: ._source.layers["arp.src.proto_ipv4"][0],
+            dst_mac: (._source.layers["arp.dst.hw_mac"][0] // "00:00:00:00:00:00"),
+            dst_ip: (._source.layers["arp.dst.proto_ipv4"][0] // "0.0.0.0")
+        }) |
+        group_by(.src_ip) |
+        map({
+            ip: .[0].src_ip,
+            mac_addresses: [.[].src_mac] | unique,
+            mac_count: ([.[].src_mac] | unique | length),
+            first_seen: (map(.timestamp) | min),
+            last_seen: (map(.timestamp) | max),
+            arp_requests: (map(select(.opcode == "1")) | length),
+            arp_replies: (map(select(.opcode == "2")) | length),
+            total_packets: length
+        })
+    ' "$JSON_DATA" > "$STATE_FILE"
+}
+
+# ==================== REGLAS DE DETECCIÓN ====================
+
+detect_mac_duplicate() {
+    local alerts=$(jq -r '
+        map(select(.mac_count > 1)) |
+        map({
+            severity: "CRITICAL",
+            rule: "MAC_DUPLICATE",
+            description: "Clonación de MAC address detectada",
+            ip: .ip,
+            mac_addresses: .mac_addresses,
+            confidence: ((.mac_count - 1) * 50 | if . > 100 then 100 else . end),
+            details: "IP \(.ip) asociada con \(.mac_count) MACs diferentes: \(.mac_addresses | join(", "))"
+        }) | .[]
+    ' "$STATE_FILE")
+
+    if [ -n "$alerts" ]; then
+        echo "$alerts" | while IFS= read -r alert; do
+            trigger_alert "$alert"
+        done
+    fi
+}
+
+detect_ip_conflict() {
+    local alerts=$(jq -r --argjson window "$TIME_WINDOW" '
+        # Agrupar por MAC y contar IPs únicas
+        group_by(.mac_addresses[0]) |
+        map(select(length > 0)) |
+        map({
+            mac: .[0].mac_addresses[0],
+            ips: [.[].ip] | unique,
+            ip_count: ([.[].ip] | unique | length)
+        }) |
+        map(select(.ip_count > 1)) |
+        map({
+            severity: "CRITICAL",
+            rule: "IP_CONFLICT",
+            description: "Conflicto de IP detectado (posible ARP spoofing)",
+            mac: .mac,
+            ips: .ips,
+            confidence: 95,
+            details: "MAC \(.mac) pretende ser múltiples IPs: \(.ips | join(", "))"
+        }) | .[]
+    ' "$STATE_FILE")
+
+    if [ -n "$alerts" ]; then
+        echo "$alerts" | while IFS= read -r alert; do
+            trigger_alert "$alert"
+        done
+    fi
+}
+
+detect_sudden_ip_change() {
+    local alerts=$(jq -r --argjson change_window "$IP_CHANGE_WINDOW" '
+        map(select(.mac_count > 1 and (.last_seen - .first_seen) < $change_window)) |
+        map({
+            severity: "HIGH",
+            rule: "SUDDEN_IP_CHANGE",
+            description: "Cambio rápido de MAC para una IP (MITM sospechoso)",
+            ip: .ip,
+            time_window: (.last_seen - .first_seen),
+            mac_changes: .mac_count,
+            confidence: 80,
+            details: "IP \(.ip) cambió de MAC \(.mac_count) veces en \(.last_seen - .first_seen | floor) segundos"
+        }) | .[]
+    ' "$STATE_FILE")
+
+    if [ -n "$alerts" ]; then
+        echo "$alerts" | while IFS= read -r alert; do
+            trigger_alert "$alert"
+        done
+    fi
+}
+
+detect_arp_flood() {
+    local alerts=$(jq -r --argjson threshold "$ARP_FLOOD_THRESHOLD" --argjson window "$TIME_WINDOW" '
+        map(select(.total_packets > $threshold)) |
+        map({
+            severity: "HIGH",
+            rule: "ARP_FLOOD",
+            description: "Tasa anormal de paquetes ARP detectada",
+            ip: .ip,
+            packet_count: .total_packets,
+            packets_per_second: (.total_packets / $window),
+            confidence: (if .total_packets > ($threshold * 2) then 95 else 75 end),
+            details: "IP \(.ip) generó \(.total_packets) paquetes ARP (\(.total_packets / $window | floor) pps)"
+        }) | .[]
+    ' "$STATE_FILE")
+
+    if [ -n "$alerts" ]; then
+        echo "$alerts" | while IFS= read -r alert; do
+            trigger_alert "$alert"
+        done
+    fi
+}
+
+detect_mac_flapping() {
+    local alerts=$(jq -r --argjson threshold "$MAC_FLAP_THRESHOLD" '
+        map(select(.mac_count >= $threshold)) |
+        map({
+            severity: "MEDIUM",
+            rule: "MAC_FLAPPING",
+            description: "Inestabilidad en tabla ARP detectada",
+            ip: .ip,
+            mac_changes: .mac_count,
+            mac_list: .mac_addresses,
+            confidence: 60,
+            details: "IP \(.ip) osciló entre \(.mac_count) MACs: \(.mac_addresses | join(", "))"
+        }) | .[]
+    ' "$STATE_FILE")
+
+    if [ -n "$alerts" ]; then
+        echo "$alerts" | while IFS= read -r alert; do
+            trigger_alert "$alert"
+        done
+    fi
+}
+
+# ==================== SISTEMA DE ALERTAS ====================
+
+trigger_alert() {
+    local alert_json="$1"
+
+    local severity=$(echo "$alert_json" | jq -r '.severity')
+    local rule=$(echo "$alert_json" | jq -r '.rule')
+
+    # Filtrar por severidad mínima
+    if ! check_severity_threshold "$severity"; then
+        return
+    fi
+
+    # Rate limiting
+    if ! check_alert_cooldown "$rule"; then
+        return
+    fi
+
+    # Registrar alerta
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "${timestamp} | ${severity} | ${rule} | ${alert_json}" >> "$ALERT_LOG"
+
+    # Mostrar en consola
+    display_alert "$alert_json"
+
+    # Enviar email si msmtp está disponible y configurado
+    if command -v msmtp &> /dev/null && [ -f /etc/msmtprc ]; then
+        send_email_alert "$alert_json"
+    fi
+}
+
+check_severity_threshold() {
+    local severity="$1"
+    local min_level="$MIN_ALERT_SEVERITY"
+
+    declare -A severity_levels=([CRITICAL]=3 [HIGH]=2 [MEDIUM]=1)
+
+    local current_level=${severity_levels[$severity]:-0}
+    local min_threshold=${severity_levels[$min_level]:-0}
+
+    [ "$current_level" -ge "$min_threshold" ]
+}
+
+check_alert_cooldown() {
+    local rule="$1"
+    local cooldown_file="${SCRIPT_DIR}/.cooldown_${rule}"
+
+    if [ -f "$cooldown_file" ]; then
+        local last_alert=$(cat "$cooldown_file")
+        local now=$(date +%s)
+        local elapsed=$((now - last_alert))
+
+        if [ "$elapsed" -lt "$ALERT_COOLDOWN" ]; then
+            return 1
+        fi
+    fi
+
+    date +%s > "$cooldown_file"
+    return 0
+}
+
+display_alert() {
+    local alert_json="$1"
+
+    local severity=$(echo "$alert_json" | jq -r '.severity')
+    local rule=$(echo "$alert_json" | jq -r '.rule')
+    local description=$(echo "$alert_json" | jq -r '.description')
+    local details=$(echo "$alert_json" | jq -r '.details')
+    local confidence=$(echo "$alert_json" | jq -r '.confidence')
+
+    local color="$NC"
+    case "$severity" in
+        CRITICAL) color="$RED" ;;
+        HIGH) color="$YELLOW" ;;
+        MEDIUM) color="$CYAN" ;;
+    esac
+
+    echo -e "\n${color}${BOLD}⚠ ALERTA: ${rule}${NC}"
+    echo -e "${color}Severidad: ${severity} | Confianza: ${confidence}%${NC}"
+    echo -e "${color}${description}${NC}"
+    echo -e "${color}${details}${NC}"
+}
+
+send_email_alert() {
+    local alert_json="$1"
+
+    local severity=$(echo "$alert_json" | jq -r '.severity')
+    local rule=$(echo "$alert_json" | jq -r '.rule')
+    local description=$(echo "$alert_json" | jq -r '.description')
+    local details=$(echo "$alert_json" | jq -r '.details')
+
+    local subject="[L2 Security] ${severity}: ${rule}"
+
+    local html_body=$(cat <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .alert { border-left: 5px solid #f44336; padding: 15px; background: #ffebee; }
+        .alert.high { border-color: #ff9800; background: #fff3e0; }
+        .alert.medium { border-color: #2196F3; background: #e3f2fd; }
+        .header { font-size: 24px; font-weight: bold; margin-bottom: 10px; }
+        .details { margin-top: 15px; padding: 10px; background: #f5f5f5; }
+        .timestamp { color: #666; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <div class="alert $(echo $severity | tr '[:upper:]' '[:lower:]')">
+        <div class="header">🚨 ${rule}</div>
+        <div class="timestamp">$(date '+%Y-%m-%d %H:%M:%S')</div>
+        <p><strong>${description}</strong></p>
+        <div class="details">${details}</div>
+        <p><em>Generado por Layer 2 Attack Detection System</em></p>
+    </div>
+</body>
+</html>
+EOF
+)
+
+    # Enviar email usando msmtp con la cuenta configurada
+    if ! command -v msmtp &> /dev/null; then
+        log "WARN" "msmtp no disponible, omitiendo email"
+        return 0
+    fi
+
+    (
+        echo "To: ${ALERT_EMAIL}"
+        echo "From: ${ALERT_EMAIL}"
+        echo "Subject: ${subject}"
+        echo "Content-Type: text/html; charset=UTF-8"
+        echo ""
+        echo "$html_body"
+    ) | msmtp -a "${MSMTP_ACCOUNT}" "${ALERT_EMAIL}" 2>&1 | \
+        tee -a "${LOG_FILE}" || log "WARN" "Error enviando email"
+}
+
+# ==================== FOOTPRINTING DE RED ====================
+
+generate_report() {
+    echo -e "\n${BOLD}${BLUE}═══════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${BLUE}        LAYER 2 NETWORK SECURITY REPORT${NC}"
+    echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════${NC}"
+
+    # Estadísticas generales
+    local total_hosts=$(jq 'length' "$STATE_FILE")
+    local total_packets=$(jq 'map(.total_packets) | add' "$STATE_FILE")
+    local suspicious_hosts=$(jq 'map(select(.mac_count > 1)) | length' "$STATE_FILE")
+
+    echo -e "\n${BOLD}📊 Estadísticas Generales:${NC}"
+    echo -e "  • Hosts únicos detectados: ${GREEN}${total_hosts}${NC}"
+    echo -e "  • Total paquetes ARP: ${GREEN}${total_packets}${NC}"
+    echo -e "  • Hosts sospechosos: ${RED}${suspicious_hosts}${NC}"
+
+    # Top 10 dispositivos más activos
+    echo -e "\n${BOLD}📡 Top 10 Dispositivos Más Activos:${NC}"
+    jq -r '
+        sort_by(-.total_packets) |
+        .[:10] |
+        .[] |
+        "  \(.ip | . + (" " * (15 - length))) | MAC: \(.mac_addresses[0]) | Paquetes: \(.total_packets) | Req/Rep: \(.arp_requests)/\(.arp_replies)"
+    ' "$STATE_FILE"
+
+    # Mapeo de red
+    echo -e "\n${BOLD}🗺️  Network Footprint (IP → MAC Mapping):${NC}"
+    jq -r '
+        sort_by(.ip) |
+        .[] |
+        if .mac_count > 1 then
+            "  ⚠️  \(.ip) → \(.mac_addresses | join(", ")) [MÚLTIPLES MACs]"
+        else
+            "  ✓  \(.ip) → \(.mac_addresses[0])"
+        end
+    ' "$STATE_FILE"
+
+    # Patrones de comportamiento
+    echo -e "\n${BOLD}🔍 Análisis de Comportamiento:${NC}"
+    jq -r '
+        map(select(.total_packets > 0)) |
+        map({
+            ip: .ip,
+            ratio: (if .arp_requests > 0 then (.arp_replies / .arp_requests) else 0 end),
+            behavior: (
+                if .mac_count > 1 then "SOSPECHOSO: Múltiples MACs"
+                elif .arp_requests > 100 then "ALTO TRÁFICO: Posible escaneo"
+                elif (.arp_replies / (.arp_requests + 0.01)) > 2 then "ANÓMALO: Más respuestas que peticiones"
+                else "NORMAL"
+                end
+            )
+        }) |
+        map(select(.behavior != "NORMAL")) |
+        .[] |
+        "  • \(.ip): \(.behavior) (Req/Rep ratio: \(.ratio * 100 | floor)%)"
+    ' "$STATE_FILE"
+
+    echo -e "\n${BOLD}${BLUE}═══════════════════════════════════════════════════════${NC}\n"
+}
+
+# ==================== INTERFAZ DE LÍNEA DE COMANDOS ====================
+
+show_usage() {
+    cat <<EOF
+${BOLD}Layer 2 Network Attack Detection System${NC}
+
+${BOLD}USO:${NC}
+    $0 [OPCIONES]
+
+${BOLD}OPCIONES:${NC}
+    -i, --interface IFACE    Interfaz de red a monitorear (autodetecta si se omite)
+    -d, --duration SECONDS   Duración de captura en segundos (default: ${MIN_CAPTURE_DURATION})
+    -l, --live               Modo análisis en tiempo real continuo
+    -a, --alert EMAIL        Email para alertas (default: ${ALERT_EMAIL})
+    -s, --severity LEVEL     Severidad mínima para alertas: CRITICAL|HIGH|MEDIUM (default: ${MIN_ALERT_SEVERITY})
+    -h, --help               Mostrar esta ayuda
+
+${BOLD}EJEMPLOS:${NC}
+    # Captura de 60 segundos en interfaz auto-detectada
+    sudo $0 -d 60
+
+    # Modo live en interfaz específica
+    sudo $0 -i eth0 -l
+
+    # Solo alertas críticas por email
+    sudo $0 -i wlan0 -d 120 -s CRITICAL -a security@empresa.com
+
+${BOLD}REGLAS DE DETECCIÓN:${NC}
+    • MAC_DUPLICATE (CRITICAL)   - Clonación de MAC addresses
+    • IP_CONFLICT (CRITICAL)     - Conflictos de IP (ARP spoofing)
+    • SUDDEN_IP_CHANGE (HIGH)    - Cambios rápidos sospechosos (MITM)
+    • ARP_FLOOD (HIGH)           - Tasa anormal de paquetes ARP
+    • MAC_FLAPPING (MEDIUM)      - Inestabilidad en tablas ARP
+
+${BOLD}REQUISITOS:${NC}
+    • tshark (Wireshark CLI)
+    • jq (JSON processor)
+    • msmtp (SMTP client, opcional)
+    • Permisos root o CAP_NET_RAW
+
+EOF
+}
+
+# ==================== MAIN ====================
+
+main() {
+    local interface=""
+    local duration="$MIN_CAPTURE_DURATION"
+    local mode="capture"
+
+    # Parsear argumentos
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -i|--interface)
+                interface="$2"
+                shift 2
+                ;;
+            -d|--duration)
+                duration="$2"
+                shift 2
+                ;;
+            -l|--live)
+                mode="live"
+                shift
+                ;;
+            -a|--alert)
+                ALERT_EMAIL="$2"
+                shift 2
+                ;;
+            -s|--severity)
+                MIN_ALERT_SEVERITY="$2"
+                shift 2
+                ;;
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            *)
+                error "Opción desconocida: $1\nUsar -h para ayuda"
+                ;;
+        esac
+    done
+
+    # Banner
+    echo -e "${BOLD}${CYAN}"
+    cat <<'EOF'
+╔═══════════════════════════════════════════════════════╗
+║   Layer 2 Network Attack Detection System             ║
+║   ARP Spoofing | MITM | MAC Flooding | Reconnaissance ║
+╚═══════════════════════════════════════════════════════╝
+EOF
+    echo -e "${NC}"
+
+    # Verificar requisitos
+    check_requirements
+
+    # Obtener interfaz
+    interface=$(get_interface "$interface")
+    log "INFO" "Usando interfaz: ${interface}"
+
+    # Limpiar archivos temporales
+    rm -f "${SCRIPT_DIR}/.cooldown_"*
+
+    # Ejecutar según modo
+    if [ "$mode" = "live" ]; then
+        capture_live "$interface"
+    else
+        capture_arp_traffic "$interface" "$duration"
+        analyze_traffic
+    fi
+
+    log "INFO" "Análisis completado. Logs: ${LOG_FILE}"
+}
+
+# Trap para limpieza
+cleanup() {
+    log "INFO" "Deteniendo monitoreo..."
+    rm -f "$JSON_DATA" "${JSON_DATA}.tmp"
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+
+# Ejecutar
+main "$@"
