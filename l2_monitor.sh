@@ -35,7 +35,7 @@ readonly MIN_CAPTURE_DURATION=30
 
 # Configuración de alertas
 DETECTED_EMAIL=$(grep -E "^from" /etc/msmtprc 2>/dev/null | awk '{print $2}' | head -n 1)
-ALERT_EMAIL="${ALERT_EMAIL:-${DETECTED_EMAIL:-jesuscg1205@gmail.com}}"
+ALERT_EMAIL="${ALERT_EMAIL:-${DETECTED_EMAIL}}"
 MSMTP_ACCOUNT="${MSMTP_ACCOUNT:-gmail}"
 readonly ALERT_COOLDOWN=300
 MIN_ALERT_SEVERITY="${MIN_ALERT_SEVERITY:-MEDIUM}"
@@ -91,7 +91,7 @@ check_requirements() {
         error "Permisos insuficientes. Ejecutar con sudo o:\nsudo setcap cap_net_raw,cap_net_admin=eip \$(which tshark)"
     fi
 
-    if command -v msmtp &> /dev/null && [ -f /etc/msmtprc ]; then
+    if command -v msmtp &> /dev/null && [ -f /etc/msmtprc ] && [ -n "$ALERT_EMAIL" ]; then
         log "INFO" "Alertas por email habilitadas → ${ALERT_EMAIL}"
     fi
 }
@@ -201,6 +201,10 @@ capture_live() {
 
     log "INFO" "Modo LIVE: ${interface} | Protocolos: ${ENABLED_PROTOCOLS[*]}"
     log "INFO" "Presionar Ctrl+C para detener..."
+    log "INFO" "Análisis automático cada 50 paquetes..."
+
+    local packet_counter=0
+    local analysis_interval=50
 
     tshark -i "$interface" -f "$filter" -T json \
         -e frame.time_epoch \
@@ -220,9 +224,15 @@ capture_live() {
         2>/dev/null | while read -r line; do
         echo "$line" >> "${PROTOCOL_DATA}.tmp"
 
-        if [ $((RANDOM % 10)) -eq 0 ]; then
+        packet_counter=$((packet_counter + 1))
+
+        # Trigger analysis every N packets
+        if [ $((packet_counter % analysis_interval)) -eq 0 ]; then
             mv "${PROTOCOL_DATA}.tmp" "$PROTOCOL_DATA" 2>/dev/null || true
-            [ -s "$PROTOCOL_DATA" ] && analyze_traffic && echo ""
+            if [ -s "$PROTOCOL_DATA" ]; then
+                log "INFO" "Analizando ${packet_counter} paquetes capturados..."
+                analyze_traffic && echo ""
+            fi
         fi
     done
 }
@@ -515,7 +525,7 @@ trigger_alert() {
 
     display_alert "$alert_json"
 
-    if command -v msmtp &> /dev/null && [ -f /etc/msmtprc ]; then
+    if command -v msmtp &> /dev/null && [ -f /etc/msmtprc ] && [ -n "$ALERT_EMAIL" ]; then
         send_email_alert "$alert_json"
     fi
 }
@@ -723,7 +733,7 @@ ${BOLD}OPCIONES:${NC}
     -l, --live                 Modo análisis continuo en tiempo real
     -p, --protocols PROTO,...  Protocolos a monitorear (default: todos)
                                Valores: arp,dhcp,stp,cdp,lldp
-    -a, --alert EMAIL          Email para alertas (default: ${ALERT_EMAIL})
+    -a, --alert EMAIL          Email para alertas (opcional, requiere msmtp configurado)
     -s, --severity LEVEL       Severidad mínima: CRITICAL|HIGH|MEDIUM (default: ${MIN_ALERT_SEVERITY})
     -h, --help                 Mostrar esta ayuda
 
