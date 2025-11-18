@@ -131,6 +131,8 @@ sudo ./l2_monitor.sh [OPCIONES]
 | `-l, --live` | Modo análisis en tiempo real continuo |
 | `-a, --alert EMAIL` | Email para alertas |
 | `-s, --severity LEVEL` | Severidad mínima: CRITICAL\|HIGH\|MEDIUM (default: MEDIUM) |
+| `-D, --debug` | Modo debug (verbose + archivos de depuración) |
+| `-P, --profile` | Generar perfiles detallados de dispositivos |
 | `-h, --help` | Mostrar ayuda |
 
 ### Ejemplos de Uso
@@ -287,6 +289,70 @@ readonly MAC_FLAP_THRESHOLD=5              # Umbral de flapping
 readonly ALERT_COOLDOWN=300                # Cooldown entre alertas (5 min)
 readonly MIN_ALERT_SEVERITY="MEDIUM"       # Severidad mínima
 ```
+
+## Device Profiling Mode
+
+El modo de perfilado genera fingerprints detallados de cada dispositivo en la red:
+
+```bash
+sudo ./l2_monitor.sh -i wlo1 -d 120 -P
+```
+
+### Información Generada por Dispositivo
+
+Cada perfil incluye:
+
+- **Estadísticas de tráfico**: Total paquetes, bytes, tamaño promedio
+- **Ventana temporal**: Primera/última aparición, duración de actividad
+- **Protocolos usados**: Distribución de protocolos Layer 2-7
+- **Direcciones IP**: IPv4 e IPv6 asociadas al MAC
+- **Puertos**: TCP/UDP origen y destino
+- **Destinos principales**: Top 5 MACs de destino
+- **Tipo estimado**: Clasificación automática del dispositivo
+- **Análisis de comportamiento**:
+  - Actividad (basado en duración > 60s)
+  - Uso de encriptación (TLS)
+  - Transmisiones broadcast/multicast
+  - Paquetes por segundo
+
+### Tipos de Dispositivos Detectados
+
+- **Router/Gateway**: DHCP + broadcasts, o IGMP/ICMPv6 + multicast
+- **DNS Server**: Tráfico en puerto 53
+- **Web Server**: Puertos 80/443
+- **Network Switch**: Protocolos STP/CDP/LLDP
+- **IoT Device**: Bajo volumen de paquetes + broadcasts
+- **Unknown**: No coincide con patrones conocidos
+
+### Archivo Generado
+
+**`device_profiles.json`** - JSON con array de perfiles
+
+```json
+[
+  {
+    "mac_address": "aa:bb:cc:dd:ee:ff",
+    "total_packets": 150,
+    "total_bytes": 45000,
+    "protocols": {"ARP": 10, "DHCP": 5, "DNS": 135},
+    "ipv4_addresses": ["192.168.1.100"],
+    "estimated_type": "Router/Gateway",
+    "behavior": {
+      "is_active": true,
+      "uses_encryption": false,
+      "broadcasts": true
+    }
+  }
+]
+```
+
+### Casos de Uso
+
+- **Inventario de red**: Descubre todos los dispositivos activos
+- **Análisis de tráfico**: Identifica patrones de comunicación
+- **Clasificación automática**: Identifica función de cada dispositivo
+- **Detección de anomalías**: Compara perfiles entre sesiones
+- **Documentación de red**: Genera mapas automáticos
 
 ## Debug Mode
 

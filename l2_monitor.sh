@@ -54,6 +54,10 @@ readonly NC='\033[0m'
 DEBUG_MODE=false
 readonly DEBUG_DIR="${SCRIPT_DIR}/debug"
 
+# Device profiling
+PROFILE_MODE=false
+readonly PROFILE_FILE="${SCRIPT_DIR}/device_profiles.json"
+
 # ==================== UTILIDADES ====================
 
 log() {
@@ -410,31 +414,57 @@ capture_traffic() {
 
     # Disable exit-on-error temporarily to handle timeout exit code 124
     set +e
+
+    # Base fields for all modes
+    local tshark_fields=(
+        -e frame.time_epoch
+        -e frame.protocols
+        -e eth.src
+        -e eth.dst
+        -e arp.opcode
+        -e arp.src.hw_mac
+        -e arp.src.proto_ipv4
+        -e arp.dst.hw_mac
+        -e arp.dst.proto_ipv4
+        -e dhcp.option.dhcp
+        -e dhcp.option.dhcp_server_id
+        -e dhcp.option.requested_ip_address
+        -e dhcp.hw.mac_addr
+        -e dhcp.ip.client
+        -e dhcp.ip.your
+        -e stp.root.hw
+        -e stp.bridge.hw
+        -e stp.type
+        -e stp.flags
+        -e cdp.deviceid
+        -e cdp.platform
+        -e lldp.chassis.id
+        -e lldp.port.id
+    )
+
+    # Additional fields for device profiling
+    if [ "$PROFILE_MODE" = true ]; then
+        tshark_fields+=(
+            -e frame.len
+            -e ip.src
+            -e ip.dst
+            -e ipv6.src
+            -e ipv6.dst
+            -e tcp.srcport
+            -e tcp.dstport
+            -e udp.srcport
+            -e udp.dstport
+            -e tcp.flags
+            -e http.request.method
+            -e dns.qry.name
+            -e tls.handshake.type
+        )
+        debug "DEBUG" "Profile mode enabled - capturing extended fields"
+    fi
+
     timeout "$duration" tshark -i "$interface" -f "$filter" \
         -T json \
-        -e frame.time_epoch \
-        -e frame.protocols \
-        -e eth.src \
-        -e eth.dst \
-        -e arp.opcode \
-        -e arp.src.hw_mac \
-        -e arp.src.proto_ipv4 \
-        -e arp.dst.hw_mac \
-        -e arp.dst.proto_ipv4 \
-        -e dhcp.option.dhcp \
-        -e dhcp.option.dhcp_server_id \
-        -e dhcp.option.requested_ip_address \
-        -e dhcp.hw.mac_addr \
-        -e dhcp.ip.client \
-        -e dhcp.ip.your \
-        -e stp.root.hw \
-        -e stp.bridge.hw \
-        -e stp.type \
-        -e stp.flags \
-        -e cdp.deviceid \
-        -e cdp.platform \
-        -e lldp.chassis.id \
-        -e lldp.port.id \
+        "${tshark_fields[@]}" \
         > "$PROTOCOL_DATA" 2>"$tshark_error"
 
     local exit_code=$?
@@ -554,6 +584,11 @@ analyze_traffic() {
     detect_dhcp_attacks
     detect_stp_attacks
     detect_discovery_recon
+
+    # Generar perfiles de dispositivos si está habilitado
+    if [ "$PROFILE_MODE" = true ]; then
+        generate_device_profiles
+    fi
 
     # Generar reporte
     generate_report
@@ -984,6 +1019,165 @@ EOF
         tee -a "${LOG_FILE}" || log "WARN" "Error enviando email"
 }
 
+# ==================== DEVICE PROFILING ====================
+
+generate_device_profiles() {
+    [ ! -s "$PROTOCOL_DATA" ] && log "WARN" "No hay datos para perfilar dispositivos" && return
+
+    log "INFO" "Generando perfiles de dispositivos..."
+    debug "DEBUG" "=== GENERATING DEVICE PROFILES ==="
+
+    jq '
+        # Extract and normalize packet data
+        map(
+            if (type == "object" and has("_source")) then ._source.layers
+            elif type == "object" then .
+            else empty
+            end
+        ) |
+        map(select(type == "object")) |
+
+        # Group by source MAC address
+        group_by(.["eth.src"][0] // .["eth.src"] // "unknown") |
+        map(
+            {
+                mac_address: (.[0]["eth.src"][0] // .[0]["eth.src"] // "unknown"),
+                packets: .,
+                packet_count: length
+            }
+        ) |
+
+        # Generate profile for each MAC
+        map({
+            mac_address: .mac_address,
+            total_packets: .packet_count,
+            first_seen: (
+                [.packets[]["frame.time_epoch"][0] // .packets[]["frame.time_epoch"] // 0 | tonumber] |
+                min |
+                if . > 0 then . else null end
+            ),
+            last_seen: (
+                [.packets[]["frame.time_epoch"][0] // .packets[]["frame.time_epoch"] // 0 | tonumber] |
+                max |
+                if . > 0 then . else null end
+            ),
+            duration_seconds: (
+                ([.packets[]["frame.time_epoch"][0] // .packets[]["frame.time_epoch"] // 0 | tonumber] | max) -
+                ([.packets[]["frame.time_epoch"][0] // .packets[]["frame.time_epoch"] // 0 | tonumber] | min) |
+                if . < 0 then 0 else . end
+            ),
+            total_bytes: (
+                [.packets[]["frame.len"][0] // .packets[]["frame.len"] // "0" | tonumber] |
+                add // 0
+            ),
+            avg_packet_size: (
+                if .packet_count > 0 then
+                    (([.packets[]["frame.len"][0] // .packets[]["frame.len"] // "0" | tonumber] | add // 0) / .packet_count | floor)
+                else
+                    0
+                end
+            ),
+            protocols: (
+                [.packets[]["frame.protocols"][0] // .packets[]["frame.protocols"] // ""] |
+                map(split(":") | .[-1] // .) |
+                group_by(.) |
+                map({key: .[0], value: length}) |
+                from_entries
+            ),
+            ipv4_addresses: (
+                [.packets[]["ip.src"][0] // .packets[]["ip.src"], .packets[]["arp.src.proto_ipv4"][0] // .packets[]["arp.src.proto_ipv4"]] |
+                flatten |
+                map(select(. != null)) |
+                unique
+            ),
+            ipv6_addresses: (
+                [.packets[]["ipv6.src"][0] // .packets[]["ipv6.src"]] |
+                flatten |
+                map(select(. != null)) |
+                unique
+            ),
+            tcp_ports: {
+                src: ([.packets[]["tcp.srcport"][0] // .packets[]["tcp.srcport"] // ""] | flatten | map(select(. != null and . != "")) | unique),
+                dst: ([.packets[]["tcp.dstport"][0] // .packets[]["tcp.dstport"] // ""] | flatten | map(select(. != null and . != "")) | unique)
+            },
+            udp_ports: {
+                src: ([.packets[]["udp.srcport"][0] // .packets[]["udp.srcport"] // ""] | flatten | map(select(. != null and . != "")) | unique),
+                dst: ([.packets[]["udp.dstport"][0] // .packets[]["udp.dstport"] // ""] | flatten | map(select(. != null and . != "")) | unique)
+            },
+            top_destinations: (
+                [.packets[]["eth.dst"][0] // .packets[]["eth.dst"]] |
+                flatten |
+                map(select(. != null)) |
+                group_by(.) |
+                map({mac: .[0], count: length}) |
+                sort_by(.count) |
+                reverse |
+                .[0:5]
+            ),
+            estimated_type: "Unknown",
+            behavior: {
+                is_active: (
+                    ([.packets[]["frame.time_epoch"][0] // .packets[]["frame.time_epoch"] // 0 | tonumber] | max) -
+                    ([.packets[]["frame.time_epoch"][0] // .packets[]["frame.time_epoch"] // 0 | tonumber] | min) > 60
+                ),
+                uses_encryption: (
+                    [.packets[]["tls.handshake.type"]] | flatten | any(. != null)
+                ),
+                broadcasts: (
+                    [.packets[]["eth.dst"][0] // .packets[]["eth.dst"]] |
+                    flatten |
+                    any(. == "ff:ff:ff:ff:ff:ff")
+                ),
+                multicast: (
+                    [.packets[]["eth.dst"][0] // .packets[]["eth.dst"]] |
+                    flatten |
+                    any(startswith("01:00:5e") or startswith("33:33"))
+                ),
+                packets_per_second: (
+                    if (([.packets[]["frame.time_epoch"][0] // .packets[]["frame.time_epoch"] // 0 | tonumber] | max) -
+                        ([.packets[]["frame.time_epoch"][0] // .packets[]["frame.time_epoch"] // 0 | tonumber] | min)) > 0 then
+                        (.packet_count / (([.packets[]["frame.time_epoch"][0] // .packets[]["frame.time_epoch"] // 0 | tonumber] | max) -
+                         ([.packets[]["frame.time_epoch"][0] // .packets[]["frame.time_epoch"] // 0 | tonumber] | min)) | floor)
+                    else
+                        0
+                    end
+                )
+            }
+        }) |
+
+        # Device type classification
+        map(
+            .estimated_type = (
+                if (.protocols.DHCP or .protocols.dhcp) and .behavior.broadcasts then
+                    "Router/Gateway"
+                elif (.protocols.DNS or .protocols.dns) and ([.udp_ports.dst[] | select(. == "53")] | length > 0) then
+                    "DNS Server"
+                elif ([.tcp_ports.dst[] | select(. == "80" or . == "443")] | length > 0) then
+                    "Web Server"
+                elif .behavior.multicast and (.protocols.IGMPv2 or .protocols.ICMPv6 or .protocols.MDNS) then
+                    "Router/Gateway"
+                elif .protocols.STP or .protocols.CDP or .protocols.LLDP then
+                    "Network Switch"
+                elif .total_packets < 10 and .behavior.broadcasts then
+                    "IoT Device"
+                else
+                    "Unknown"
+                end
+            ) | .
+        )
+    ' "$PROTOCOL_DATA" > "$PROFILE_FILE"
+
+    local device_count=$(jq '. | length' "$PROFILE_FILE" 2>/dev/null || echo "0")
+    log "INFO" "Perfiles de ${device_count} dispositivos generados: ${PROFILE_FILE}"
+
+    if [ "$DEBUG_MODE" = true ]; then
+        debug "INFO" "Device profiles summary:"
+        jq -r '.[] | "  \(.mac_address): \(.total_packets) packets, Type: \(.estimated_type)"' "$PROFILE_FILE" | head -10 | while IFS= read -r line; do
+            debug "INFO" "$line"
+        done
+    fi
+}
+
 # ==================== REPORTING ====================
 
 generate_report() {
@@ -1086,6 +1280,7 @@ ${BOLD}OPCIONES:${NC}
     -a, --alert EMAIL          Email para alertas (opcional, requiere msmtp configurado)
     -s, --severity LEVEL       Severidad mínima: CRITICAL|HIGH|MEDIUM (default: ${MIN_ALERT_SEVERITY})
     -D, --debug                Habilitar modo debug (salida verbose + archivos de debug)
+    -P, --profile              Generar perfiles detallados de dispositivos (device_profiles.json)
     -h, --help                 Mostrar esta ayuda
 
 ${BOLD}EJEMPLOS:${NC}
@@ -1100,6 +1295,9 @@ ${BOLD}EJEMPLOS:${NC}
 
     # Modo debug para troubleshooting
     sudo $0 -d 30 -D
+
+    # Perfilado de dispositivos con detección de ataques
+    sudo $0 -i wlo1 -d 120 -P
 
 ${BOLD}PROTOCOLOS MONITOREADOS:${NC}
     ${MAGENTA}ARP${NC}     - Spoofing, flooding, MAC duplication, IP conflicts
@@ -1159,6 +1357,10 @@ main() {
                 ;;
             -D|--debug)
                 DEBUG_MODE=true
+                shift
+                ;;
+            -P|--profile)
+                PROFILE_MODE=true
                 shift
                 ;;
             -h|--help)
